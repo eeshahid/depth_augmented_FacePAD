@@ -15,66 +15,38 @@ import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-###############################################
+from models import DualBranchMobileNet, MultiChannelCNN, DepthAuxiliaryMobileNet, CNN3ch, MobileNetStudent
+from datasets import VideoDataset3ch_OULU, VideoDataset4ch_OULU, VideoDataset3ch, VideoDataset4ch
+from utils import create_log_directory, AdaptiveCenterCropAndResize, collate_fn, save_checkpoint, train_epoch, validate_epoch, train_epoch_distill, validate_epoch_student
+
 ############### Args ##########################
-###############################################
-
-def create_log_directory(base_dir='/home/muhammad_jabbar/face_PAD/logs'):
-    # Ensure the base log directory exists
-    if not os.path.exists(base_dir):
-        os.makedirs(base_dir)
-    # Get a list of existing directories in the base_dir
-    existing_dirs = os.listdir(base_dir)
-    # Find the highest current log number
-    log_numbers = []
-    for d in existing_dirs:
-        if d.startswith('log_'):
-            try:
-                # Extract the numeric part and check for format
-                num_str = d.split('_')[1]
-                log_numbers.append(int(num_str))
-            except ValueError:
-                pass
-    # Determine the next log number
-    next_num = 1 if not log_numbers else max(log_numbers) + 1
-    log_num = f"{next_num:03d}"  # Ensure a 3-digit number
-    # Get current date and time
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Create the new log directory name
-    new_log_dir = os.path.join(base_dir, f'log_{log_num}_{timestamp}')
-    # Create the new directory
-    os.makedirs(new_log_dir)
-    return new_log_dir
-
-log_dir = create_log_directory()
-#############
+log_dir = create_log_directory(base_dir='/data/muhammad_jabbar/github/depth_augmented_FacePAD/logs')
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Model with RGB + Depth input')
-
-    # Adding arguments
+    parser.add_argument('--log_dir', type=str, default='/data/muhammad_jabbar/github/depth_augmented_FacePAD/logs', help='Path to save training logs and checkpoints')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device number')
-    parser.add_argument('--num_frames', type=int, default=1, help='Number of frames for each video')
+    parser.add_argument('--num_epochs', type=int, default=100, help='num_epochs for training the model (early stopping applied)')
+    parser.add_argument('--num_frames', type=int, choices = [1], default=1, help='Number of frames for each video')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--model', type=str, default='DB', choices = ['3ch', 'DB, 4ch, Aux, KD'], help='Model to be trained')
+    parser.add_argument('--chkpt_path', type=str, default='', help='Teacher model checkpoint path (.pth) for knowledge distillation (model=KD)')
     parser.add_argument('--orig_dataset_path', type=str, default='/data/muhammad_jabbar/datasets/Oulu_NPU', help='Path to original video dataset')
-    parser.add_argument('--depth_dataset_path', type=str, default='/data/muhammad_jabbar/datasets/Oulu_NPU_depth_mp4', help='Path to depth map dataset')
+    parser.add_argument('--depth_dataset_path', type=str, default='/data/muhammad_jabbar/datasets/Oulu_NPU_depth_mp4', help='Path to cached depth map dataset (videos)')
+    parser.add_argument('--dataset', type=str, default='RA', choices = ['RA, RM, RY, OULU'], help='Dataset to be used')
     parser.add_argument('--protocol', type=str, default='4', help='OULU-NPU dataset protocol being trained')
     parser.add_argument('--n_split', type=str, default='6', help='OULU-NPU dataset split for protocol 3 & 4')
-
     parser.add_argument('--exp_description', type=str, default='Train Model with RGB+Depth 4channel input, channel expansion, MobileNetv3Large (With pretrained weights), OULU-NPU train data, Protocol-4 (Split-6)')
-
     return parser.parse_args()
-
 args = parse_args()
-args.log_dir = log_dir
+
+log_dir = create_log_directory(base_dir=args.log_dir)
 
 # Print all arguments
-print()
-print('############### Args ##########################')
+print('\n############### Args ##########################')
 for arg, value in vars(args).items():
     print(f"{arg}: {value}")
-print('################################################')
-print()
+print('################################################\n')
 
 # Print arguments to log file
 with open(os.path.join(args.log_dir, 'training_log.txt'), 'w') as log_file:
@@ -83,191 +55,142 @@ with open(os.path.join(args.log_dir, 'training_log.txt'), 'w') as log_file:
         log_file.write(f"{arg}: {value}\n")
     log_file.write('################################################\n')
     log_file.write('\n')
-
 ######################################################
 
-class AdaptiveCenterCropAndResize:
-    def __init__(self, output_size):
-        """
-        Args:
-            output_size (tuple or int): The desired output size after resizing (e.g., (32, 32)).
-        """
-        self.output_size = output_size
-        self.to_pil = transforms.ToPILImage()
-        self.to_tensor = transforms.ToTensor()
+transform = transforms.Compose([AdaptiveCenterCropAndResize((224, 224))]),  # Adaptive crop, resize, and convert to tensor
 
-    def __call__(self, img):
-        # Convert tensor to PIL image if necessary
-        if isinstance(img, torch.Tensor):
-            img = self.to_pil(img)
-
-        # Handle single-channel images
-        if img.mode != 'RGB':
-            img = img.convert('L')  # Convert to grayscale mode
-            
-        # Get image size (width, height)
-        width, height = img.size
-
-        # Find the minimum dimension to create the largest possible square
-        crop_size = min(width, height)
-
-        # Calculate the coordinates to center-crop the square
-        left = (width - crop_size) // 2
-        top = (height - crop_size) // 2
-        right = (width + crop_size) // 2
-        bottom = (height + crop_size) // 2
-
-        # Crop the image to the largest square
-        img = img.crop((left, top, right, bottom))
-
-        # Resize the cropped square to the desired output size
-        img = img.resize(self.output_size, Image.Resampling.LANCZOS)
-
-        # Convert the resized image back to a tensor
-        img = self.to_tensor(img)
-
-        return img
-
-def collate_fn(batch):
-    max_length = max([frames.size(0) for frames, _ in batch])  # Get the maximum sequence length
-    padded_frames = []  # To store padded 4-channel tensors
-    labels = []  # To store labels
-    
-    for frames, label in batch:
-        if frames.size(0) < max_length:
-            # Pad with zeros along the frame dimension
-            padding = torch.zeros((max_length - frames.size(0), *frames.shape[1:]))
-            # padded_frames.append(torch.cat((frames, padding), dim=0))
-            padded_frames.append(torch.cat((frames, padding), dim=0))  # Pad at the end
+if args.model == '3ch':
+    if args.dataset == 'OULU-NPU':
+        if args.protocol=='3' or args.protocol=='4':
+            t_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Train_{args.n_split}.txt'
         else:
-            padded_frames.append(frames)
-
-        labels.append(label)
-    
-    # Stack all sequences and labels
-    padded_frames = torch.stack(padded_frames)  # Shape: (batch_size, max_length, 4, H, W)
-    labels = torch.tensor(labels)  # Shape: (batch_size,)
-
-    return padded_frames, labels
-
-######################################################
-
-transform = transforms.Compose([
-    AdaptiveCenterCropAndResize((224, 224)),  # Adaptive crop, resize, and convert to tensor
-    # transforms.ToPILImage(),
-    # transforms.ToTensor(),
-])
-
-train_dataset = VideoDataset4ch(
-    orig_root_dir=args.orig_dataset_path+'/train',
-    depth_root_dir=args.depth_dataset_path+'/train',
-    transform=transform,
-    num_frames=args.num_frames,
-    is_train=True
-)
-
-val_dataset = VideoDataset4ch(
-    orig_root_dir=args.orig_dataset_path+'/devel',
-    depth_root_dir=args.depth_dataset_path+'/devel',
-    transform=transform,
-    num_frames=args.num_frames,
-    is_train=False
-)
+            t_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Train.txt'
+        train_dataset = VideoDataset3ch_OULU(
+            orig_root_dir=args.orig_dataset_path+'/Train_files',
+            file_list_path = t_protocol_flist,
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=True,
+            protocol = args.protocol
+        )
+        if args.protocol=='3' or args.protocol=='4':
+            v_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Dev_{args.n_split}.txt'
+        else:
+            v_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Dev.txt'
+        val_dataset = VideoDataset3ch_OULU(
+            orig_root_dir=args.orig_dataset_path+'/Dev_files',
+            file_list_path = protocol_flist,
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=False,
+            protocol = args.protocol
+        )
+    else:
+        train_dataset = VideoDataset3ch(
+            orig_root_dir=args.orig_dataset_path+'/train',
+            depth_root_dir=args.depth_dataset_path+'/train',
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=True
+        )
+        val_dataset = VideoDataset3ch(
+            orig_root_dir=args.orig_dataset_path+'/devel',
+            depth_root_dir=args.depth_dataset_path+'/devel',
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=False
+        )
+else: # for depth augmented models
+    if args.dataset == 'OULU-NPU':
+        if args.protocol=='3' or args.protocol=='4':
+            t_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Train_{args.n_split}.txt'
+        else:
+            t_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Train.txt'
+        train_dataset = VideoDataset4ch_OULU(
+            orig_root_dir=args.orig_dataset_path+'/Train_files',
+            depth_root_dir=args.depth_dataset_path+'/Train_files',
+            file_list_path = t_protocol_flist,
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=True,
+            protocol = args.protocol
+        )
+        if args.protocol=='3' or args.protocol=='4':
+            v_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Dev_{args.n_split}.txt'
+        else:
+            v_protocol_flist = f'/data/muhammad_jabbar/datasets/Oulu_NPU/Baseline/Protocol_{args.protocol}/Dev.txt'
+        val_dataset = VideoDataset4ch_OULU(
+            orig_root_dir=args.orig_dataset_path+'/Dev_files',
+            depth_root_dir=args.depth_dataset_path+'/Dev_files',
+            file_list_path = v_protocol_flist,
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=False,
+            protocol = args.protocol
+        )
+    else:
+        train_dataset = VideoDataset4ch(
+            orig_root_dir=args.orig_dataset_path+'/train',
+            depth_root_dir=args.depth_dataset_path+'/train',
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=True
+        )
+        val_dataset = VideoDataset4ch(
+            orig_root_dir=args.orig_dataset_path+'/devel',
+            depth_root_dir=args.depth_dataset_path+'/devel',
+            transform=transform,
+            num_frames=args.num_frames,
+            is_train=False
+        )
 
 # Instantiate dataloaders with custom collate function
 train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=True)
+print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+print(f'Train data loader length: {len(train_loader)}, Val data loader length: {len(val_loader)}\n')
 
-print(f"Training samples: {len(train_dataset)}")
-print(f"Validation samples: {len(val_dataset)}")
-print()
+########################## Model Instantiation ##########################
 
-print(f'Train data loader length: {len(train_loader)}')
-print(f'Val data loader length: {len(val_loader)}')
-print()
+device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
-############### Instantiate the model ##########################
-
-device = torch.device(f'cuda:{args.gpu}')
-# device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
-model = DualBranchMobileNet(num_classes=2).to(device)
+if args.model = 'DB':
+    model = DualBranchMobileNet(num_classes=2).to(device)
+elif args.model = 'Aux':
+    model = DepthAuxiliaryMobileNet(num_classes=2).to(device)
+elif args.model = '4ch':
+    model = MultiChannelCNN(num_classes=2).to(device)
+elif args.model = '3ch':
+    model = CNN3ch(num_classes=2).to(device)
+elif args.model = 'KD':
+    student_model = MobileNetStudent(num_classes=2).to(device)
+    checkpoint = torch.load(args.chkpt_path, weights_only=True)
+    teacher_model = DualBranchMobileNet(num_classes=2).to(device)
+    teacher_model.load_state_dict(checkpoint['model_state_dict'])
+    teacher_model.eval()
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+else:
+    raise ValueError("Invalid model choice. Choose from ['3ch', 'DB', '4ch', 'Aux', 'KD'].")
 
 ########################## Train ##########################
 
-# Hyperparameters and setup
-criterion = nn.CrossEntropyLoss()  # For final classification
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-writer = SummaryWriter(log_dir=args.log_dir)
+# 
+if args.model != 'KD':
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+else:
+    # Distillation hyperparameters
+    alpha = 0.7  # weight for distillation loss
+    temperature = 3.0
+    criterion_CE = nn.CrossEntropyLoss()
+    criterion_KL = nn.KLDivLoss(reduction='batchmean')
+    optimizer_student = optim.Adam(student_model.parameters(), lr=1e-4)
 
-# Directory to save checkpoints
-checkpoint_dir = os.path.join(args.log_dir, 'checkpoints')
+writer = SummaryWriter(log_dir=args.log_dir)
+checkpoint_dir = os.path.join(args.log_dir, 'checkpoints') # Directory to save checkpoints
 if not os.path.exists(checkpoint_dir):
     os.makedirs(checkpoint_dir)
-
-# Function to save model checkpoints
-def save_checkpoint(state, is_best, filename="checkpoint.pth"):
-    torch.save(state, os.path.join(checkpoint_dir, filename))
-    if is_best:
-        torch.save(state, os.path.join(checkpoint_dir, "best_model.pth"))
-
-# Training loop
-def train_epoch(model, loader, criterion, optimizer, epoch):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    
-    with tqdm(loader, unit="batch") as tepoch:
-        for inputs, labels in tepoch:
-            tepoch.set_description(f"Epoch {epoch}")
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(inputs)
-            
-            # Supervised Contrastive Learning (or CrossEntropy)
-            loss = criterion(outputs, labels)
-            
-            # Backpropagation
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            tepoch.set_postfix(loss=running_loss/total, accuracy=100. * correct/total)
-
-    epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = 100. * correct / total
-    return epoch_loss, epoch_acc
-
-# Validation loop
-def validate_epoch(model, loader, criterion):
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels in loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            # Forward pass
-            outputs = model(inputs)
-            
-            # Loss calculation
-            loss = criterion(outputs, labels)
-            running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-
-    epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = 100. * correct / total
-    return epoch_loss, epoch_acc
 
 # Initialize variables to track best validation loss
 best_val_loss = float('inf')
@@ -275,21 +198,27 @@ early_stopping_counter = 0
 early_stopping_patience = 10  # Number of epochs to wait before stopping early
 
 # Training loop
-num_epochs = 100
+num_epochs = args.num_epochs
 for epoch in range(num_epochs):
-    # Train and validate for each epoch
-    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, epoch)
-    val_loss, val_acc = validate_epoch(model, val_loader, criterion)
 
+    # Train and validate for each epoch
+    if args.model == 'KD':
+        train_loss, train_acc = train_epoch_distill(
+            student_model, teacher_model, train_loader, criterion_CE, criterion_KL, optimizer_student,
+            alpha, temperature, epoch
+        )
+        val_loss, val_acc = validate_epoch_student(student_model, val_loader, criterion_CE)
+    else:
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, epoch)
+        val_loss, val_acc = validate_epoch(model, val_loader, criterion)
+
+    # Logging metrics
     with open(os.path.join(args.log_dir, 'training_log.txt'), 'a') as log_file:
         log_file.write(f"Epoch {epoch+1}, Training Loss: {train_loss}, Training Acc: {train_acc}\n")
         log_file.write(f"Epoch {epoch+1}, Valication Loss: {val_loss}, Valication Acc: {val_acc}\n")
-        log_file.write("\n")
-    
-    # Logging metrics
+        log_file.write("\n")    
     writer.add_scalars('Loss', {'train': train_loss, 'val': val_loss}, epoch)
     writer.add_scalars('Accuracy', {'train': train_acc, 'val': val_acc}, epoch)
-    
     print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
 
     # Save best model if validation loss improves
@@ -314,10 +243,8 @@ for epoch in range(num_epochs):
     # Early stopping condition
     if early_stopping_counter >= early_stopping_patience:
         print("Early stopping triggered")
-
         with open(os.path.join(args.log_dir, 'training_log.txt'), 'a') as log_file:
             log_file.write("Early stopping triggered")
-
         break
 
 writer.close()
