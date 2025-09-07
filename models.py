@@ -1,6 +1,6 @@
-
-
-
+import torch
+import torch.nn as nn
+from torchvision import models
 
 ################################################
 ##### Model Class (Image/Depth, 3-channels) ####
