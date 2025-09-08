@@ -10,6 +10,11 @@ This project augments face anti-spoofing (FacePAD) with **synthetic depth cues**
 
 ---
 
+## Note
+Please note that we have only provided unified code dataset/model classes and utilized functions for processing/training. We plan to test the update the curernt form of code, and provide remaining methods. For questions, or bugs, please open an **Issue** on this repository.
+
+---
+
 ## Key Features
 - **Depth-augmented dual branch:** RGB textures + depth structure fused (feature concatenation) before the classifier.
 - **KD for real-time use:** Distill the dual-branch teacher into a single-branch MobileNet student (RGB-only inference).
@@ -119,6 +124,7 @@ issn = {0950-7051},
 doi = {https://doi.org/10.1016/j.knosys.2025.114325},
 url = {https://www.sciencedirect.com/science/article/pii/S0950705125013656},
 author = {Muhammad Shahid Jabbar and Taha Hasan Masood Siddique and Kejie Huang and Shujaat Khan},
-}```
+}
+```
 
 ---
