@@ -52,7 +52,7 @@ This repo supports four standard FacePAD benchmarks (data: video files):
 
 ---
 
-## Preparing Depth Maps (optional for teacher)
+## Preparing Depth Maps
 The **teacher** (and other depth-augmented models) consumes RGB frames **and** their **aligned** depth maps. You can generate depth maps offline with monocular depth estimator (we used *Depth-Anything V2, as reported in the paper).
 
 ---
